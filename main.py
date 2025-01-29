@@ -3,10 +3,13 @@ from fastapi.responses import StreamingResponse
 import httpx
 import uvicorn
 import json
+from harvest.jsonl_db import JSONLDB
+
 app = FastAPI()
+db = JSONLDB()  # Initialize our database handler
 
 # Custom function to stream the response from the target API
-async def stream_api_response(url: str, data: dict, headers: dict):
+async def stream_api_response(model: str, url: str, data: dict, headers: dict):
     """
     Makes a streaming request to another API and yields the responses.
     """
@@ -34,6 +37,10 @@ async def stream_api_response(url: str, data: dict, headers: dict):
                 if chunk_json.get('done', False) and chunk_json.get('done_reason', '') == 'stop':
                     print("🎉 Final chunk received")
                     print(accumulated_content)
+                    messages = data['messages']
+                    messages.append({"role": "assistant", "content": accumulated_content})
+                    # Save the completed chat to the database
+                    await db.add(model, messages)
 
 async def forward_request(request: Request, url: str):
     """
@@ -44,22 +51,39 @@ async def forward_request(request: Request, url: str):
         json_data = await request.json()
         print("Got request: ", json_data)
 
+        # Make sure that the request has a model
+        if 'model' not in json_data:
+            raise HTTPException(
+                status_code=400,
+                detail="Model is required"
+            )
+        
+        if 'messages' not in json_data:
+            raise HTTPException(
+                status_code=400,
+                detail="Messages are required"
+            )
+        
+        model = json_data['model']
+        messages = json_data['messages']
+
         if 'stream' not in json_data or json_data.get('stream', True):
             return StreamingResponse(
-                stream_api_response(url, json_data, {}),
+                stream_api_response(model, url, json_data, {}),
                 media_type='text/event-stream'
             )
 
-        # Forward the request to the target server
+        # Handle non-streaming request
         async with httpx.AsyncClient() as client:
-            # 11434 is the default port for Ollama
-            response = await client.post(
-                url,
-                json=json_data
-            )
-            # Return the response from the target server
+            response = await client.post(url, json=json_data)
             return_json = response.json()
             print("Got response: ", return_json)
+            
+            # Save the chat to the database for non-streaming requests
+            messages.append(return_json['message'])
+            
+            await db.add(model, messages)
+            
             return return_json
     except Exception as e:
         # Catch any errors and return a 500 error
@@ -78,6 +102,12 @@ async def generate(request: Request):
 @app.post("/api/chat")
 async def chat_completion(request: Request):
     return await forward_request(request, "http://localhost:11434/api/chat")
+
+# Add a new endpoint to retrieve chat history
+@app.get("/api/history")
+async def get_history(limit: int = 100):
+    """Retrieve chat history from the database."""
+    return await db.get_chat_history(limit)
 
 if __name__ == "__main__":
     # Run the FastAPI server on port 11435
